@@ -1,0 +1,1175 @@
+__all__ = [
+    "remove_fastly_dictionary_entries",
+    "remove_all_dictionary_entries",
+    "remove_dictionary_entry",
+    "list_items_in_an_edge_dictionary",
+    "upload_fastly_dictionary_entry",
+    "upload_fastly_dictionary_entries",
+    "remove_old_fastly_dictionary_entries",
+    "find_fastly_dictionary_entry_value",
+    "upload_fastly_acl_entries",
+    "backup_acl",
+]
+
+import json
+import os
+import time
+from datetime import datetime
+from time import sleep
+
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+from logger import (
+    write_to_logfile,
+    line_number,
+    error_handler,
+    engage,
+    end_of_line,
+    create_new_output_file,
+    write_to_file,
+    print_value_info,
+)
+
+REQUESTS_TIMEOUT = 20
+REQUEST_ATTEMPTS = 5
+FASTLY_API_BATCH_SIZE = 999
+
+# Define Fastly API URL
+FASTLY_API_URL = "https://api.fastly.com"
+
+# Define Filename (For Logging)
+FASTLY_FILENAME = os.path.basename(__file__)
+
+# Define Fastly Service URL
+SERVICE_INFO_URL = FASTLY_API_URL + "/service"
+
+# Verified Fastly Key
+VERIFIED_API_TOKEN = False
+
+#
+HTML_ESCAPE_KEYS = {
+    "/": "%2F",
+    "?": "%3F",
+    "!": "%21",
+    "#": "%23",
+    "_": "%5F",
+    "~": "%7E",
+    " ": "%20",
+}
+
+HTML_UN_ESCAPE_KEYS = {
+    "/": "% 2F",
+    "?": "% 3F",
+    "!": "% 21",
+    "#": "% 23",
+    "_": "% 5F",
+    "~": "% 7E",
+    " ": "% 20",
+}
+
+SERVICE_IDS = {}
+SERVICE_VERSIONS = {}
+SERVICE_ACL_IDS = {}
+DICTIONARY_IDS = {}
+
+
+def _json_extractor(request):
+    get_data = str(json.dumps(request.json()))
+    json_data = json.loads(get_data)
+    return json_data
+
+
+def _request_validation(response, request_line, attempt):
+    response_data = _json_extractor(response)
+    if response.status_code == 200:
+        return True
+    else:
+        if "Please specify at least one entry." in response_data["msg"]:
+            error_handler(response_data["msg"], request_line)
+            return True
+        getting_sleepy = 5 * attempt
+        error_handler(f'Attempt {attempt} of {REQUEST_ATTEMPTS}: {response_data["msg"]}', request_line)
+        write_to_logfile(f'Next attempt in {getting_sleepy} seconds.')
+        time.sleep(getting_sleepy)
+    if "You Have Exceeded Your Hourly Rate Limit." in response_data["msg"].title():
+        write_to_logfile("Trying Again in 1 Minute")
+        sleep(60)
+    return False
+
+
+def _get_request(request_url: str, api_key: str):
+    attempt = 0
+    if _fastly_api_token_verified(api_key):
+        while attempt < REQUEST_ATTEMPTS:
+            attempt += 1
+            line = line_number() + 1
+            data = requests.get(
+                request_url,
+                headers={"Fastly-Key": api_key},
+                timeout=REQUESTS_TIMEOUT,
+                verify=False
+            )
+            if _request_validation(data, line, attempt):
+                return data
+            else:
+                sleep(1)
+    return False
+
+
+def _delete_request(request_url: str, api_key: str):
+    attempt = 0
+    request_line = line_number()
+    if _fastly_api_token_verified(api_key):
+        while attempt < REQUEST_ATTEMPTS:
+            attempt += 1
+            data = requests.delete(
+                request_url,
+                headers={"Fastly-Key": api_key},
+                timeout=REQUESTS_TIMEOUT,
+                verify=False
+            )
+            if _request_validation(data, request_line, attempt):
+                return data
+    return False
+
+
+def _patch_request(request_url: str, in_data: dict, api_key: str):
+    attempt = 0
+    request_line = line_number()
+    if _fastly_api_token_verified(api_key):
+        while attempt < REQUEST_ATTEMPTS:
+            attempt += 1
+            data = requests.patch(
+                request_url,
+                headers={"Fastly-Key": api_key},
+                json=in_data,
+                timeout=REQUESTS_TIMEOUT,
+                verify=False
+            )
+            if _request_validation(data, request_line, attempt):
+                return data
+    return False
+
+
+def _api_parser_by_field(r: str, fields: list):
+    api_list = _json_extractor(r)
+    if type(api_list) == dict:
+        api_list = api_list["data"]
+    api_info_list = []
+    for api_list_entry in api_list:
+        dictionary = api_list_entry
+        entries = []
+        for service_field in fields:
+            entries.append(dictionary[service_field])
+        api_info_list.append(entries)
+    return api_info_list
+
+
+def _get_list_of_fastly_services(api_key: str):
+    if _fastly_api_token_verified(api_key):
+        write_to_logfile("Grabbing List of Fastly Services")
+        return _api_parser_by_field(
+            _get_request(FASTLY_API_URL + "/service", api_key),
+            ["name", "id", "version"],
+        )
+    else:
+        return False
+
+
+def _not_found(subject: str, name: str):
+    write_to_logfile(subject + ' "' + name + '" was not found')
+    # end_of_line(FILENAME)
+
+
+def _not_found_plural(subject: str, name: str):
+    write_to_logfile(f"{subject} for {name} were not found")
+    # end_of_line(FILENAME)
+
+
+def _fastly_id(name: str, find: str, url: str, fields: list, api_key: str):
+    if _fastly_api_token_verified(api_key):
+        info_list = _api_parser_by_field(_get_request(url, api_key), fields)
+        search_list = []
+        results = []
+        # write_to_logfile("Finding " + find + ": " + name)
+        for i in info_list:
+            search_list.append(i[0])
+        if name not in search_list:
+            _not_found(find, name)
+            end_of_line()
+            # print('Search List:')
+            # print(search_list)
+            return False
+        else:
+            for i in info_list:
+                if i[0] == name:
+                    results.append(str(i[1]))
+                    if find == "Service":
+                        name_version = str(i[2])
+                        results.append(name_version)
+                    return results
+    else:
+        return False
+
+
+def _fastly_api_token_verified(api_key):
+    global VERIFIED_API_TOKEN
+    if VERIFIED_API_TOKEN is False:
+        write_to_logfile("Verifying Fastly API Token")
+        # Verify API Key
+        request_line = line_number() + 2
+        try:
+            api_verification_code = requests.get(
+                FASTLY_API_URL + "/service",
+                headers={"Fastly-Key": api_key},
+                timeout=REQUESTS_TIMEOUT,
+                verify=False
+            ).status_code
+            if api_verification_code != 200:
+                error_handler(
+                    "Fastly API Verification Failed Status Code: "
+                    + str(api_verification_code),
+                    line_number(),
+                )
+                end_of_line()
+                return False
+            else:
+                write_to_logfile("API Token Verified")
+                VERIFIED_API_TOKEN = True
+                return True
+        except requests.exceptions.RequestException as e:
+            error_handler(f"{e}", request_line)
+            return False
+    else:
+        return True
+
+
+def _escape_item_key(item_key):
+    for symbol in HTML_ESCAPE_KEYS:
+        item_key = item_key.replace(symbol, HTML_ESCAPE_KEYS[symbol])
+    return item_key
+
+
+def _un_escape_item_key(item_key):
+    for symbol in HTML_UN_ESCAPE_KEYS:
+        item_key = item_key.replace(symbol, HTML_UN_ESCAPE_KEYS[symbol])
+    return item_key
+
+
+def remove_fastly_dictionary_entries(
+    service_name: str, dictionary_name: str, dictionary_items: list, api_key: str
+):
+    """
+    Removes specified entries from a Fastly dictionary
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str dictionary_name: Name of Fastly dictionary
+    :param list dictionary_items: Specifies the keys to remove from the Fastly dictionary
+    :param str api_key: Fastly API key
+    """
+    function_line = line_number()
+    write_to_logfile(
+        f"Attempting to delete Fastly entries in Dictionary: {dictionary_name} in Service: {service_name}"
+    )
+    if _fastly_api_token_verified(api_key):
+        service_id = _find_service_id(service_name, api_key)
+        dictionary_id = _find_dictionary_id(dictionary_name, service_name, api_key)
+        current_dictionary_items = list_items_in_an_edge_dictionary(
+            service_name, dictionary_name, api_key
+        )
+        current_dictionary_keys = []
+        for current_dictionary_item in current_dictionary_items:
+            current_dictionary_keys.append(current_dictionary_item["item_key"])
+        # print_value_info(current_dictionary_keys)
+        if service_id and dictionary_id:
+            split_entries_to_update = _split_python_list(
+                dictionary_items, FASTLY_API_BATCH_SIZE
+            )
+            batches = len(split_entries_to_update)
+            for count, entries in enumerate(split_entries_to_update):
+                batch = count + 1
+                patch_url = f"{FASTLY_API_URL}/service/{service_id}/dictionary/{dictionary_id}/items"
+                data = {}
+                items = []
+                for key in entries:
+                    if key in current_dictionary_keys:
+                        item = {
+                            "op": "delete",
+                            "item_key": key,
+                        }
+                        items.append(item)
+                if items:
+                    data["items"] = items
+                    log_text = f"Attempting to delete batch {batch} of {batches} to Fastly Dictionary: {dictionary_name} in Service: {service_name}"
+                    write_to_logfile(log_text)
+                    patch_response = _patch_request(patch_url, data, api_key)
+                    if patch_response:
+                        if patch_response.status_code == 200:
+                            write_to_logfile(f"Delete Successful")
+                            return True
+                        else:
+                            error_handler(
+                                f"Failed to delete the following values to to Dictionary: {dictionary_name} in Service: {service_name}",
+                                function_line,
+                            )
+                            write_to_logfile(f"{entries}")
+                else:
+                    write_to_logfile(
+                        f"Fastly service, {service_name}, dictionary, {dictionary_name}, contains none of the values provided to remove."
+                    )
+            else:
+                return False
+    else:
+        return False
+
+
+def remove_all_dictionary_entries(
+    service_name: str, dictionary_name: str, api_key: str
+):
+    """
+    Removes all entries  a Fastly dictionary
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str dictionary_name: Name of Fastly dictionary
+    :param str api_key: Fastly API key
+    """
+    function_line = line_number()
+    if _fastly_api_token_verified(api_key):
+        service_id = _find_service_id(service_name, api_key)
+        dictionary_id = _find_dictionary_id(dictionary_name, service_name, api_key)
+        items_in_dictionary = list_items_in_an_edge_dictionary(
+            service_name, dictionary_name, api_key
+        )
+        list_of_items_in_dictionary = []
+        if items_in_dictionary:
+            for list_item in items_in_dictionary:
+                list_of_items_in_dictionary.append(list_item["item_key"])
+            remove_fastly_dictionary_entries(
+                service_name, dictionary_name, list_of_items_in_dictionary, api_key
+            )
+            return True
+        else:
+            error_handler(
+                f"Dictionary: {dictionary_name} in Service: {service_name} is empty",
+                function_line,
+            )
+            return False
+    else:
+        return False
+
+
+def remove_dictionary_entry(
+    service_name: str, dictionary_name: str, dictionary_item_key: str, api_key: str
+):
+    """
+    Removes a specified entry from Fastly dictionary
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str dictionary_name: Name of Fastly dictionary
+    :param list dictionary_item_key: Specifies the key to remove from the Fastly dictionary
+    :param str api_key: Fastly API key
+    """
+    # print_value_info(service_name)
+    if _fastly_api_token_verified(api_key):
+        service_id = _find_service_id(service_name, api_key)
+        dictionary_id = _find_dictionary_id(dictionary_name, service_name, api_key)
+        write_to_logfile(
+            f'Attempting to remove "{dictionary_item_key}" from Dictionary: {dictionary_name} in Service: {service_name}'
+        )
+        dictionary_item_key = _escape_item_key(dictionary_item_key)
+        delete_url = f"{FASTLY_API_URL}/service/{service_id}/dictionary/{dictionary_id}/item/{dictionary_item_key}"
+        # write_to_logfile(delete_url)
+        line = line_number() + 1
+        deleted_request = _delete_request(delete_url, api_key)
+        try:
+            result = _json_extractor(deleted_request)
+            if deleted_request.status_code == 200:
+                write_to_logfile("Successfully Deleted Dictionary Entry")
+                return True
+        except Exception as e:
+            error_handler(f"{e}", line)
+            return False
+        # else:
+        #    write_to_logfile(error_handler(result["msg"], line_number()))
+        #    if "You Have Exceeded Your Hourly Rate Limit." in result["msg"].title():
+        #        write_to_logfile("Trying Again in 1 Minute")
+        #        sleep(60)
+        #        delete_dictionary_entry(service_id, dictionary_id, dictionary_item_key)
+    else:
+        return False
+
+
+def list_items_in_an_edge_dictionary(
+    service_name: str, dictionary_name: str, api_key: str
+):
+    """
+    Finds all items within a Fastly dictionary
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str dictionary_name: Name of Fastly dictionary
+    :param str api_key: Fastly API key
+    :return: Fastly dictionary content as Python dictionary, False if dictionary is not found or empty.
+    """
+    if _fastly_api_token_verified(api_key):
+        try:
+            line = line_number() + 1
+            dictionary_id = _find_dictionary_id(dictionary_name, service_name, api_key)
+            service_id = _find_service_id(service_name, api_key)
+            if dictionary_id:
+                write_to_logfile(
+                    f"Grabbing dictionary contents for: {dictionary_name}, in Service: {service_name}"
+                )
+
+                # url = FASTLY_API_URL + "/service/" + serv_id + "/dictionary/" + dictionary_id + "/items"
+                url = f"{FASTLY_API_URL}/service/{service_id}/dictionary/{dictionary_id}/items"
+                dictionary_contents = _json_extractor(_get_request(url, api_key))
+                if "msg" in dictionary_contents:
+                    if "Cannot find service" in dictionary_contents["detail"]:
+                        error_msg, error_detail = (
+                            dictionary_contents["msg"],
+                            dictionary_contents["detail"].partition("'")[0]
+                            + service_name,
+                        )
+                        error_handler(error_detail, line_number())
+                    else:
+                        error_handler(dictionary_contents["detail"], line_number())
+                    return False
+                return dictionary_contents
+            else:
+                write_to_logfile(
+                    f"Unable to get dictionary_id for: {dictionary_name}, in Service: {service_name}"
+                )
+        except Exception as e:
+            error_handler(f"{e}", line)
+    else:
+        return False
+
+
+def _list_edge_dictionaries_for_service(service_name: str, api_key: str):
+    """
+    Finds all dictionaries for the current version of a specified Fastly service
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str api_key: Fastly API key
+    :return: A list of lists. Each list has the following values. list[0] = dictionary name, list[1] = dictionary id, list[2] = service id, list[3] = current service version
+    """
+    if _fastly_api_token_verified(api_key):
+        _find_service(service_name, api_key)
+        service_info = _find_service(service_name, api_key)
+        service_id, version_id = service_info[1], service_info[2]
+        # write_to_logfile("Grabbing Dictionaries for Service: " + service_name)
+        # url = FASTLY_API_URL + "/service/" + service_id + "/version/" + version_id + "/dictionary"
+        url = f"{FASTLY_API_URL}/service/{service_id}/version/{version_id}/dictionary"
+        try:
+            line = line_number() + 1
+            dictionaries = _api_parser_by_field(
+                _get_request(url, api_key), ["name", "id", "service_id", "version"]
+            )
+        except Exception as e:
+            dictionaries = []
+            error_handler(f"{e}", line)
+        return dictionaries
+    else:
+        return False
+
+
+def _get_dictionary_info(
+    dictionary_name: str, service_name: str, field: str, api_key: str
+):
+    if _fastly_api_token_verified(api_key):
+        try:
+            line = line_number() + 1
+            try:
+                edge_dictionaries = _list_edge_dictionaries_for_service(
+                    service_name, api_key
+                )
+            except Exception as e:
+                write_to_logfile(f"The Fastly dictionary, {dictionary_name}, is empty.")
+                return
+            found_dictionaries = []
+            found_dictionary_names = []
+            line = line_number() + 1
+            for edge_dictionary in edge_dictionaries:
+                line = line_number() + 1
+                if dictionary_name == edge_dictionary[0]:
+                    line = line_number() + 1
+                    found_dictionaries.append(edge_dictionary)
+                    line = line_number() + 1
+                    found_dictionary_names.append(edge_dictionary[0])
+            line = line_number() + 1
+            try:
+                dictionary = found_dictionaries[0]
+            except IndexError:
+                error_handler(
+                    f"Unable to locate Dictionary: {dictionary_name} in Service: {service_name}",
+                    line,
+                )
+                return False
+            if field == "dictionary_id":
+                line = line_number() + 1
+                DICTIONARY_IDS[service_name] = {
+                    dictionary_name: {"dictionary_id": dictionary[1]}
+                }
+                line = line_number() + 1
+                return dictionary[1]
+        except Exception as e:
+            error_handler(f": {e}", line)
+            return False
+    else:
+        return False
+
+
+def _find_dictionary_id(dictionary_name: str, service_name: str, api_key: str):
+    """
+    Finds the id of a Fastly dictionary
+
+    :param str dictionary_name: Name of Fastly dictionary
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str api_key: Fastly API key
+    :return: Dictionary ID as a string, False if dictionary or service is not found within Fastly.
+    """
+    if _fastly_api_token_verified(api_key):
+        try:
+            dictionary_id = DICTIONARY_IDS[service_name][dictionary_name][
+                "dictionary_id"
+            ]
+        except KeyError:
+            dictionary_id = _get_dictionary_info(
+                dictionary_name, service_name, "dictionary_id", api_key
+            )
+        return dictionary_id
+    else:
+        return False
+
+
+def _find_service_id(service_name: str, api_key: str):
+    """
+    Finds the id of a Fastly service
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str api_key: Fastly API key
+    :return: Dictionary ID as a string, False if service is not found within Fastly.
+    """
+    # print_value_info(service_name)
+    if _fastly_api_token_verified(api_key):
+        try:
+            service_id = SERVICE_IDS[service_name]
+        except KeyError:
+            service_id = _find_service(service_name, api_key)[1]
+            SERVICE_IDS[service_name] = service_id
+        return service_id
+    else:
+        return False
+
+
+def _find_service_version(service_name: str, api_key: str):
+    """
+    Finds the id of a Fastly service. Caches the service id into global dictionary to reduce number of API calls.
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str api_key: Fastly API key
+    :return: The current version of the specified Fastly service.
+    """
+    try:
+        service_version = SERVICE_VERSIONS[service_name]
+    except KeyError:
+        service_version = _find_service(service_name, api_key)[2]
+    return service_version
+
+
+def _find_acl_id(service_name: str, acl_name: str, api_key: str):
+    try:
+        acl_id = SERVICE_ACL_IDS[service_name][acl_name]["id"]
+    except KeyError:
+        service_id, service_version = _find_service_id(
+            service_name, api_key
+        ), _find_service_version(service_name, api_key)
+        acl_url = f"{FASTLY_API_URL}/service/{service_id}/version/{service_version}/acl"
+        acl_info = _fastly_id(
+            acl_name, "Access Control List", acl_url, ["name", "id"], api_key
+        )
+        if acl_info:
+            acl_id = acl_info[0]
+            SERVICE_ACL_IDS[service_name] = {acl_name: {"id": acl_id}}
+        else:
+            # return f"Unable to find acl: {acl_name} in service: {service_name}"
+            return False
+    return acl_id
+
+
+def backup_fastly_dictionary(service_name: str, dictionary_name: str, api_key: str):
+    """
+    Exports Fastly dictionary to CSV file.
+    Example: service_name.dictionary_name.timestamp.csv
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str dictionary_name: Name of Fastly dictionary
+    :param str api_key: Fastly API key
+    """
+
+    if _fastly_api_token_verified(api_key):
+        write_to_logfile(
+            f"Backing up Fastly Dictionary: {dictionary_name} in Service: {service_name} to CSV"
+        )
+        try:
+            line = line_number() + 1
+            dictionary_items = list_items_in_an_edge_dictionary(
+                service_name, dictionary_name, api_key
+            )
+            line = line_number() + 1
+            if not dictionary_items:
+                return False
+            # print_value_info(dictionary_items)
+            now = datetime.now()
+            backup_dictionary_csv = f'{service_name}.{dictionary_name}.{now.strftime("%Y.%m.%d_%H.%M.%S")}.csv'
+            create_new_output_file(backup_dictionary_csv)
+            # write_to_logfile("Writing data to: " + backup_dictionary_csv)
+            write_to_file(
+                backup_dictionary_csv,
+                ["item_key", "item_value", "Created", "Last Updated"],
+            )
+            for dictionary_item in dictionary_items:
+                write_to_file(
+                    backup_dictionary_csv,
+                    [
+                        dictionary_item["item_key"],
+                        dictionary_item["item_value"],
+                        dictionary_item["created_at"],
+                        dictionary_item["updated_at"],
+                    ],
+                )
+            return backup_dictionary_csv
+        except Exception as e:
+            error_handler(f"{e}", line)
+
+    else:
+        return False
+
+
+def _find_service(service_name: str, api_key: str):
+    # write_to_logfile('Finding Service: ' + service_name)
+    """
+    service_name = service[0],
+    service_id = service[1],
+    service_version = service[2]
+    :param str service_name: Name of Fastly service
+    :param str api_key: Fastly API Key
+    """
+    service_info_list = _fastly_id(
+        service_name, "Service", SERVICE_INFO_URL, ["name", "id", "version"], api_key
+    )
+    if service_info_list:
+        service_id = service_info_list[0]
+        service_version = service_info_list[1]
+        service = [service_name, service_id, service_version]
+        return service
+    else:
+        _not_found("Service", service_name)
+        end_of_line()
+        return False
+
+
+def upload_fastly_acl_entries(
+    service_name: str, acl_name: str, ips: list, api_key: str, comment=None
+):
+    if _fastly_api_token_verified(api_key):
+        write_to_logfile(
+            f"Attempting to write entries to ACL: {acl_name}, in Service: {service_name}"
+        )
+
+        # Grabbing ids for Service and ACL
+        service_id = _find_service_id(service_name, api_key)
+        acl_id = _find_acl_id(service_name, acl_name, api_key)
+
+        # Generating URL for requests
+        patch_url = f"{FASTLY_API_URL}/service/{service_id}/acl/{acl_id}/entries"
+
+        # Get existing ACL entries for reference
+        existing_acl_entries = _list_acl_entries(service_name, acl_name, api_key)
+        existing_cidrs = []
+        for entry_id in existing_acl_entries:
+            cidr_entry = f'{existing_acl_entries[entry_id]["ip"]}/{existing_acl_entries[entry_id]["subnet"]}'
+            if "None" in cidr_entry:
+                cidr_entry = cidr_entry.split("/")[0]
+            existing_cidrs.append(cidr_entry)
+
+        # Populate json_data for entries
+        entries = []
+        for ip_entry in ips:
+            if ip_entry not in existing_cidrs:
+                entry_data = {'op': 'create'}
+                if '/' in ip_entry:
+                    entry_data['ip'] = ip_entry.split('/')[0]
+                    entry_data['subnet'] = ip_entry.split('/')[1]
+                else:
+                    entry_data['ip'] = ip_entry
+                entries.append(entry_data)
+                if comment:
+                    entry_data['comment'] = comment
+            else:
+                write_to_logfile(f"Entry {ip_entry}, already exists in ACL: {acl_name}")
+        data = {"entries": entries}
+        # print_value_info(data)
+
+        # Upload payload
+        patch_response = _patch_request(request_url=patch_url, in_data=data, api_key=api_key)
+        # print_value_info(patch_response)
+        if patch_response.status_code == 200:
+            write_to_logfile(f"Upload Successful")
+        else:
+            error_handler(f"Failed to upload any values to to Access Control List: {acl_name} in Service: {service_name}", line_number())
+        return True
+    else:
+        return False
+
+
+def upload_fastly_acl_entry(
+    service_name: str, acl_name: str, ip: str, comment: str, api_key: str, subnet=None
+):
+    service_id = _find_service_id(service_name, api_key)
+    acl_id = _find_acl_id(service_name, acl_name, api_key)
+    if service_id and acl_id:
+        existing_entry_id = _find_acl_entry_id(ip, service_name, acl_name, api_key)
+        if existing_entry_id:
+            return True
+        write_to_logfile(f'Adding "{ip}" to ACL: {acl_name} in Service: {service_name}')
+        acl_entry_url = f"{FASTLY_API_URL}/service/{service_id}/acl/{acl_id}/entry"
+        acl_entry_headers = {"Fastly-Key": api_key}
+        acl_entry_payload = {"ip": ip, "comment": comment}
+        if subnet:
+            acl_entry_payload.update({"subnet": subnet})
+        error_count = 0
+        error_max = 5
+        while error_count < error_max:
+            error_count += 1
+            upload = requests.post(
+                acl_entry_url, headers=acl_entry_headers, data=acl_entry_payload, verify=False
+            )
+            upload_dict = _json_extractor(upload)
+            request_line = line_number() - 2
+            if upload.status_code == 200:
+                error_count += 5
+                write_to_logfile(
+                    f'Upload Status: Created At {datetime.strptime(upload_dict["created_at"], "%Y-%m-%dT%H:%M:%SZ")}'
+                )
+                return True
+            else:
+                upload_dict = _json_extractor(upload)
+                try:
+                    error_message = f'{FASTLY_FILENAME}: Attempt {error_count} of {error_max}. {upload_dict["msg"]}: {upload_dict["detail"]}'
+                except KeyError:
+                    error_message = f'{FASTLY_FILENAME}: Attempt {error_count} of {error_max}. {upload_dict["msg"]}'
+                attempt_sleep = 5 * error_count
+                error_handler(f"{error_message}. Retry in {attempt_sleep} seconds ", request_line)
+                sleep(attempt_sleep)
+    return False
+
+
+def upload_fastly_dictionary_entry(
+    service_name: str,
+    dictionary_name: str,
+    item_key: str,
+    item_value: str,
+    api_key: str,
+):
+    """
+    Uploads a single key/value pair to a Fastly dictionary
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str dictionary_name: Name of Fastly dictionary
+    :param str item_key: The key name for the entry
+    :param str item_value: The value for the entry
+    :param str api_key: Fastly API key
+    :return: True - Upload successful, False - Upload failed
+    """
+    function_line = line_number()
+    if _fastly_api_token_verified(api_key):
+        service_id = _find_service_id(service_name, api_key)
+        dictionary_id = _find_dictionary_id(dictionary_name, service_name, api_key)
+        if service_id and dictionary_id:
+            write_to_logfile(
+                f'Attempting to write "{item_key}" to Dictionary: {dictionary_name} in Service: {service_name}'
+            )
+            patch_url = f"{FASTLY_API_URL}/service/{service_id}/dictionary/{dictionary_id}/items"
+            data = {
+                "items": [
+                    {"op": "upsert", "item_key": item_key, "item_value": item_value}
+                ]
+            }
+            patch_response = _patch_request(patch_url, data, api_key)
+            if patch_response:
+                if patch_response.status_code == 200:
+                    write_to_logfile(f"Upload Successful")
+                    return True
+                else:
+                    error_handler(
+                        f"Failed to upload {item_key} to to Dictionary: {dictionary_name} in Service: {service_name}",
+                        function_line,
+                    )
+                    return False
+            else:
+                return False
+    else:
+        error_handler(
+            f"Failed to upload {item_key} to to Dictionary: {dictionary_name} in Service: {service_name}",
+            function_line,
+        )
+        return False
+
+
+def upload_fastly_dictionary_entries(
+    service_name: str, dictionary_name: str, input_dictionary: dict, api_key: str
+):
+    """
+    Uploads a single key/value pair to a Fastly dictionary
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str dictionary_name: Name of Fastly dictionary
+    :param dict input_dictionary: key/value pairs as entries to insert into Fastly dictionary
+    :param str api_key: Fastly API key
+    :return: False - Upload failed
+    """
+    function_line = line_number()
+    if _fastly_api_token_verified(api_key):
+        service_id = _find_service_id(service_name, api_key)
+        dictionary_id = _find_dictionary_id(dictionary_name, service_name, api_key)
+        if service_id and dictionary_id:
+            split_entries_to_update = _split_python_dictionary(
+                input_dictionary, FASTLY_API_BATCH_SIZE
+            )
+            batches = len(split_entries_to_update)
+            for count, entries in enumerate(split_entries_to_update):
+                batch = count + 1
+                log_text = f"Attempting to write batch {batch} of {batches} to Fastly Dictionary: {dictionary_name} in Service: {service_name}"
+                write_to_logfile(log_text)
+                patch_url = f"{FASTLY_API_URL}/service/{service_id}/dictionary/{dictionary_id}/items"
+                data = {}
+                items = []
+                for key in entries:
+                    item = {"op": "upsert", "item_key": key, "item_value": entries[key]}
+                    items.append(item)
+                data["items"] = items
+                patch_response = _patch_request(patch_url, data, api_key)
+                if patch_response:
+                    if patch_response.status_code == 200:
+                        write_to_logfile(f"Upload Successful")
+                        return True
+                    else:
+                        error_handler(
+                            f"Failed to upload the following values to to Dictionary: {dictionary_name} in Service: {service_name}",
+                            function_line,
+                        )
+                        write_to_logfile(f"\n{entries}")
+    else:
+        return False
+
+
+def _split_python_dictionary(input_dict, chunk_size):
+    res = []
+    new_dict = {}
+    for k, v in input_dict.items():
+        if len(new_dict) < chunk_size:
+            new_dict[k] = v
+        else:
+            res.append(new_dict)
+            new_dict = {k: v}
+    res.append(new_dict)
+    return res
+
+
+def _split_python_list(input_list, chunk_size):
+    return [
+        input_list[i * chunk_size : (i + 1) * chunk_size]
+        for i in range((len(input_list) + chunk_size - 1) // chunk_size)
+    ]
+
+
+# Need to validate functionality
+def _remove_acl_entry(
+    acl_entry_id: str, service_name: str, acl_name: str, api_key: str
+):
+    write_to_logfile(f"Removing Entry ID: {acl_entry_id}")
+    service_id = _find_service_id(service_name, api_key)
+    acl_id = _find_acl_id(service_name, acl_name, api_key)
+    acl_removal_url = (
+        f"{FASTLY_API_URL}/service/{service_id}/acl/{acl_id}/entry/{acl_entry_id}"
+    )
+    remove_request = requests.delete(acl_removal_url, headers={"Fastly-Key": api_key}, verify=False)
+    remove = _json_extractor(remove_request)
+    remove_line = line_number() - 2
+    if remove_request.status_code == 200:
+        write_to_logfile(f'Removal Status: {remove["status"]}')
+    else:
+        # error_message = f'{FILENAME}: {remove["msg"]} - {remove["detail"]}'
+        error_message = f'{FASTLY_FILENAME}: {remove["msg"]}'
+        error_handler(error_message, remove_line)
+
+
+def _find_acl_entry_id(cidr: str, service_name: str, acl_name: str, api_key: str):
+    entries = _list_acl_entries(service_name, acl_name, api_key)
+    if entries:
+        for entry_id in entries:
+            if entries[entry_id]["subnet"]:
+                entry_cidr = f'{entries[entry_id]["ip"]}/{entries[entry_id]["subnet"]}'
+            else:
+                entry_cidr = f'{entries[entry_id]["ip"]}'
+            if cidr == entry_cidr:
+                write_to_logfile(f"{cidr} exists in ACL: {acl_name}")
+                return entry_id
+    return False
+
+
+def _list_acls_for_service(service_name, api_key):
+    if _fastly_api_token_verified(api_key):
+        service_id = _find_service(service_name, api_key)[1]
+        service_version = _find_service_version(service_name=service_name, api_key=api_key)
+        url = f"{FASTLY_API_URL}/service/{service_id}/version/{service_version}/acl"
+        acls = []
+        acl_results = _json_extractor(request=_get_request(request_url=url, api_key=api_key))
+        for acl_result in acl_results:
+            acls.append(acl_result['name'])
+        return acls
+    else:
+        return False
+
+
+def _list_dictionary_entries(service_name: str, dictionary_name: str, api_key: str):
+    if _fastly_api_token_verified(api_key):
+        line = line_number() + 1
+        dictionary_id = _find_dictionary_id(dictionary_name, service_name, api_key)
+        service_id = _find_service_id(service_name, api_key)
+        if dictionary_id:
+            write_to_logfile(
+                f"Grabbing dictionary contents for: {dictionary_name}, in Service: {service_name}"
+            )
+
+            # url = FASTLY_API_URL + "/service/" + serv_id + "/dictionary/" + dictionary_id + "/items"
+            url = f"{FASTLY_API_URL}/service/{service_id}/dictionary/{dictionary_id}/items"
+            fastly_dictionary = []
+            dictionary_contents = _json_extractor(_get_request(url, api_key))
+            # print(f"Debug: Raw API Response for {dictionary_name}: {dictionary_contents}")
+            for dictionary in dictionary_contents:
+                entry = {
+                    "key": dictionary['item_key'],
+                    "value": dictionary['item_value'],
+                    "created": dictionary['created_at'],
+                    "updated": dictionary['updated_at']
+                }
+                fastly_dictionary.append(entry)
+            return fastly_dictionary
+    else:
+        return False
+
+
+def _list_acl_entries(service_name: str, acl_name: str, api_key: str):
+    service_id = _find_service(service_name, api_key)[1]
+    acl_id = _find_acl_id(service_name, acl_name, api_key)
+    url = f"{FASTLY_API_URL}/service/{service_id}/acl/{acl_id}/entries?direction=ascend&sort=created"
+    results = _get_request(url, api_key)
+    acl_entries = _json_extractor(results)
+    entries = {}
+    if results.status_code == 200:
+        for acl_entry in acl_entries:
+            entry_id = acl_entry["id"]
+            entry_ip = acl_entry["ip"]
+            entry_subnet = acl_entry["subnet"]
+            entry_comment = acl_entry["comment"]
+            entry_creation_date = datetime.strptime(
+                acl_entry["created_at"], "%Y-%m-%dT%H:%M:%SZ"
+            )
+            entries[entry_id] = {
+                "ip": entry_ip,
+                "subnet": entry_subnet,
+                "comment": entry_comment,
+                "created_at": entry_creation_date,
+            }
+        return entries
+    else:
+        _not_found_plural(f"Access Control List Entries", acl_name)
+        return False
+
+
+def remove_acl_entries(service_name: str, acl_name: str, ips: list, api_key: str):
+    if _fastly_api_token_verified(api_key):
+        acl_entries = _list_acl_entries(service_name, acl_name, api_key)
+        # print_value_info(acl_entries)
+        write_to_logfile(f"Removing Entries for ACL: {acl_name} in Service: {service_name}")
+        if acl_entries:
+            payload_data = {'entries': []}
+            for entry_id in acl_entries:
+                # if {acl_entries[entry_id]["subnet"]} != 'None':
+                #     cidr_entry = f'{acl_entries[entry_id]["ip"]}/{acl_entries[entry_id]["subnet"]}'
+                # else:
+                #     cidr_entry = f'{acl_entries[entry_id]["ip"]}'
+                cidr_entry = _cidr_maker(acl_entries[entry_id]["ip"], acl_entries[entry_id]["subnet"])
+                if cidr_entry in ips:
+                    payload_data['entries'].append({
+                        'op': 'delete',
+                        'id': entry_id
+                    })
+            if payload_data['entries']:
+                service_id = _find_service_id(service_name, api_key)
+                acl_id = _find_acl_id(service_name, acl_name, api_key)
+                patch_url = f"{FASTLY_API_URL}/service/{service_id}/acl/{acl_id}/entries"
+                # print_value_info(payload_data)
+                request_info = _json_extractor(_patch_request(patch_url, payload_data, api_key))
+                try:
+                    if request_info['status'] == 'ok':
+                        return True
+                except KeyError:
+                    error_handler(f"ACL removal(s) failed.", line_number())
+                    return False
+            else:
+                write_to_logfile(f'All provided IPs do not exist in ACL: {acl_name}, in Service: {service_name}')
+        else:
+            write_to_logfile(
+                f"There are no entries for ACL: {acl_name} in Service: {service_name}. ACL is empty.")
+        return True
+    else:
+        return False
+
+
+def remove_all_acl_entries(service_name: str, acl_name: str, api_key: str):
+    acl_entries = _list_acl_entries(service_name, acl_name, api_key)
+    write_to_logfile(f"Removing Entries for ACL: {acl_name} in Service: {service_name}")
+    if acl_entries:
+        payload_data = {'entries': []}
+        for entry_id in acl_entries:
+            payload_data['entries'].append({
+                'op': 'delete',
+                'id': entry_id})
+        service_id = _find_service_id(service_name, api_key)
+        acl_id = _find_acl_id(service_name, acl_name, api_key)
+        patch_url = f"{FASTLY_API_URL}/service/{service_id}/acl/{acl_id}/entries"
+
+        request_info = _json_extractor(_patch_request(patch_url, payload_data, api_key))
+        try:
+            if request_info['status'] == 'ok':
+                return True
+        except KeyError:
+            print_value_info(request_info)
+            error_handler(f"ACL removal(s) failed.")
+            return False
+    write_to_logfile(f"There are no entries for ACL: {acl_name} in Service: {service_name}. ACL is already empty.")
+    return True
+
+
+def backup_acl(service_name: str, acl_name: str, api_key: str):
+    write_to_logfile(f'Backing Up ACL: "{acl_name}" in service: "{service_name}"')
+    acl_entries = _list_acl_entries(service_name, acl_name, api_key)
+    backup_filename = f'{service_name}.{acl_name}.{datetime.now().strftime("%Y.%m.%d_%H.%M.%S")}.csv'
+    create_new_output_file(backup_filename)
+    write_to_file(
+        backup_filename, ["ip", "subnet", "comment", "created_at"]
+    )
+    if acl_entries:
+        for entry_id in acl_entries:
+            # if acl_entries[entry_id]["subnet"]:
+            #     cidr = (
+            #         f'{acl_entries[entry_id]["ip"]}/{acl_entries[entry_id]["subnet"]}'
+            #     )
+            # else:
+            #     cidr = f'{acl_entries[entry_id]["ip"]}'
+            ip = acl_entries[entry_id]["ip"]
+            subnet = acl_entries[entry_id]["subnet"]
+            comment = acl_entries[entry_id]["comment"]
+            created = acl_entries[entry_id]['created_at']
+            write_to_file(backup_filename, [ip, subnet, comment, created])
+    return backup_filename
+
+
+def _cidr_maker(ip, subnet):
+    if subnet:
+        cidr = f"{ip}/{subnet}"
+    else:
+        cidr = f"{ip}"
+    return cidr
+
+
+# Need to validate functionality
+def _remove_old_fastly_acl_entries(
+    service_name: str, acl_name: str, maximum_days_old: int, api_key: str
+):
+    write_to_logfile(
+        f"Checking ACL: {acl_name} in Service: {service_name} for entries older than {maximum_days_old} days."
+    )
+    entries = _list_acl_entries(service_name, acl_name, api_key)
+    for acl_entry_id in entries:
+        acl_entry_dict = entries[acl_entry_id]
+        cidr = _cidr_maker(acl_entry_dict["ip"], acl_entry_dict["subnet"])
+        days_old = (datetime.now() - acl_entry_dict["created_at"]).days
+        if days_old > maximum_days_old:
+            write_to_logfile(
+                f"Entry, {cidr}, is more than {maximum_days_old} days old."
+            )
+            _remove_acl_entry(acl_entry_id, service_name, acl_name, api_key)
+
+
+def _convert_time_string(date_string: str):
+    """
+    :param date_string: %Y-%m-%dT%H:%M:%SZ
+    :returns date_string as a datetime variable
+    """
+    return datetime.strptime(date_string, "%Y-%m-%dT%H:%M:%SZ")
+
+
+def remove_old_fastly_dictionary_entries(
+    service_name: str, dictionary_name: str, maximum_days_old: int, api_key: str
+):
+    write_to_logfile(
+        f"Checking Dictionary: {dictionary_name} in Service: {service_name} "
+        f"for entries older than {maximum_days_old} days."
+    )
+    entries = list_items_in_an_edge_dictionary(service_name, dictionary_name, api_key)
+    items_to_delete = []
+    if entries:
+        for entry in entries:
+            created = _convert_time_string(entry["created_at"])
+            days_old = (datetime.now() - created).days
+            entry_key = entry["item_key"]
+            if days_old > maximum_days_old:
+                write_to_logfile(
+                    f"Entry, {entry_key} (age: {days_old}), is more than {maximum_days_old} days old."
+                )
+                items_to_delete.append(entry_key)
+        if items_to_delete:
+            write_to_logfile(f"Removing entries older than {maximum_days_old} days.")
+            remove_fastly_dictionary_entries(
+                service_name, dictionary_name, items_to_delete, api_key
+            )
+        else:
+            write_to_logfile(f"No entries older than {maximum_days_old} days.")
+        return
+    else:
+        write_to_logfile(f"No entries older than {maximum_days_old} days.")
+
+
+def find_fastly_dictionary_entry_value(
+    service_name: str, dictionary_name: str, item_key: str, api_key: str
+):
+    """
+    Uploads a single key/value pair to a Fastly dictionary
+
+    :param str service_name: Name of Fastly service associated with the dictionary
+    :param str dictionary_name: Name of Fastly dictionary
+    :param str item_key: The key name for the dictionary entry
+    :param str api_key: Fastly API key
+    :return: Key value in Fastly, or False - Upload failed
+    """
+    if _fastly_api_token_verified(api_key):
+        write_to_logfile(
+            f'Finding Value of "{item_key}" in Dictionary: {dictionary_name}, Service: {service_name}.'
+        )
+        service_id = _find_service_id(service_name, api_key)
+        dictionary_id = _find_dictionary_id(dictionary_name, service_name, api_key)
+        if service_id and dictionary_id:
+            item_url = f"{FASTLY_API_URL}/service/{service_id}/dictionary/{dictionary_id}/item/{item_key}"
+            item = _json_extractor(_get_request(item_url, api_key))
+            item_value = item["item_value"]
+        else:
+            item_value = False
+        return item_value
+    else:
+        return False
